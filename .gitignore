@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Local docs index (SQLite + WAL)
+.docs-index/
+
+# Editor & OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# Folders kept locally but not part of the public repo
+archive/
+specs/
