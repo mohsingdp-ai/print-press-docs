@@ -140,3 +140,22 @@ python docs-index.py sync \
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+
+## Commands
+
+```bash
+cd /c/Mohsin/RnD-mock-projects/print-press-equals-docs
+python docs-index.py clear docs.equalsmoney.com --yes
+time python docs-index.py sync https://docs.equalsmoney.com/ --workers 32 --verbose 2>&1 | tail -20
+```
+
+```bash
+python docs-index.py sites
+```
+# cross-vendor search — webhooks across both APIs
+python docs-index.py search "webhook signature" --all
+
+# set Stripe as the active site for follow-up questions
+python docs-index.py use docs.equalsmoney.com
+python docs-index.py search "webhook"
