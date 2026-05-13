@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "docs": {
+      "command": "python",
+      "args": [
+        "C:\\Mohsin\\RnD-mock-projects\\print-press-equals-docs\\docs-index.py",
+        "mcp"
+      ]
+    }
+  }
+}
