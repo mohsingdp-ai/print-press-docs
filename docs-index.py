@@ -1833,7 +1833,25 @@ def cmd_mcp(args):
                     sql += "ORDER BY bm25(sections_fts) LIMIT ?"
                     qp.append(a.get("limit", 10))
                     rows = conn.execute(sql, qp).fetchall()
-                    payload = [dict(r) for r in rows]
+                    # Render hits as readable markdown so the agent doesn't
+                    # have to un-escape JSON \n on every line.
+                    if not rows:
+                        text_payload = "(no matches)"
+                    else:
+                        chunks = []
+                        for i, r in enumerate(rows, 1):
+                            chunks.append(
+                                f"## [{i}] [{r['host']}] {r['path']}\n"
+                                f"**page:** {r['page_title'] or '(untitled)'}  "
+                                f"**section:** § {r['heading'] or '(intro)'}\n"
+                                f"**path:** `{r['heading_path']}`  "
+                                f"**url:** {r['url']}\n\n"
+                                f"{r['section_content']}\n"
+                            )
+                        text_payload = "\n---\n\n".join(chunks)
+                    reply(rid, {"content": [{"type": "text",
+                                              "text": text_payload}]})
+                    continue
                 elif name == "cat_doc":
                     t = a["path_or_url"]
                     site = a.get("site") or get_active_site(conn)
@@ -1845,7 +1863,8 @@ def cmd_mcp(args):
                         where = "(" + where + ") AND host=?"
                         qp2 = qp2 + (site,)
                     r = conn.execute(
-                        f"SELECT host,path,title,url,content FROM pages WHERE {where}",
+                        f"SELECT host,path,title,url,content,fetched_at "
+                        f"FROM pages WHERE {where}",
                         qp2,
                     ).fetchone()
                     if not r:
@@ -1854,10 +1873,27 @@ def cmd_mcp(args):
                             lw += " AND host=?"
                             lp = lp + (site,)
                         r = conn.execute(
-                            f"SELECT host,path,title,url,content FROM pages "
-                            f"WHERE {lw} ORDER BY length(path) LIMIT 1", lp,
+                            f"SELECT host,path,title,url,content,fetched_at "
+                            f"FROM pages WHERE {lw} ORDER BY length(path) LIMIT 1", lp,
                         ).fetchone()
-                    payload = dict(r) if r else None
+                    if r:
+                        text_payload = (
+                            f"# {r['title'] or '(untitled)'}\n"
+                            f"\n"
+                            f"- host: `{r['host']}`\n"
+                            f"- url:  {r['url']}\n"
+                            f"- path: `{r['path']}`\n"
+                            f"- fetched: {r['fetched_at']}\n"
+                            f"\n"
+                            f"---\n"
+                            f"\n"
+                            f"{r['content']}"
+                        )
+                    else:
+                        text_payload = f"not found: {t}"
+                    reply(rid, {"content": [{"type": "text",
+                                              "text": text_payload}]})
+                    continue
                 elif name == "list_sites":
                     rows = conn.execute(
                         "SELECT host, COUNT(*) AS pages, MAX(fetched_at) AS last_seen "
