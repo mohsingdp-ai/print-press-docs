@@ -20,7 +20,15 @@ context blowup, without an embeddings provider.
 ```bash
 git clone https://github.com/mohsingdp-ai/print-press-docs.git
 cd print-press-docs
-pip install --user beautifulsoup4 html2text     # optional but recommended
+
+# optional but recommended (cleaner HTML -> markdown extraction)
+pip install --user beautifulsoup4 html2text
+
+# optional, for client-rendered SPAs (Mintlify v3, Next.js App Router,
+# Docusaurus, Gatsby) — uses a headless Chromium to discover the JS-only
+# navigation that HTTP-only scraping can't see
+pip install --user playwright
+python -m playwright install chromium
 
 # index any docs site
 python docs-index.py sync https://docs.equalsmoney.com/ --workers 32 -v
@@ -32,7 +40,7 @@ python docs-index.py sites
 ```
 
 `docs-index.py` is a single file. No build step, no third-party required
-to run — both deps degrade gracefully if missing.
+to run — every optional dep degrades gracefully if missing.
 
 ## CLI
 

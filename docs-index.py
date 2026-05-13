@@ -76,6 +76,12 @@ try:
 except Exception:
     HAVE_H2T = False
 
+try:
+    from playwright.sync_api import sync_playwright  # type: ignore
+    HAVE_PLAYWRIGHT = True
+except Exception:
+    HAVE_PLAYWRIGHT = False
+
 USER_AGENT = "docs-index/0.2 (+local-indexer)"
 DB_PATH = Path.home() / ".docs-index" / "index.db"
 REQUEST_TIMEOUT = 30
@@ -512,13 +518,17 @@ def http_get(url, headers=None):
 
 def discover_urls(seed_url, prefix_only=False, max_pages=DEFAULT_MAX_PAGES,
                   verbose=False):
-    """Discovery chain, fast to slow:
-      1. /sitemap.xml + /sitemap_index.xml
-      2. /robots.txt -> Sitemap: lines
-      3. /llms.txt + /llms-full.txt
-      4. /mint.json + /docs.json (Mintlify nav)
-      5. Wayback Machine CDX API (works for almost any public site)
-      6. BFS crawl from the seed (last resort)
+    """Discovery — UNION of every method, deduped:
+       1. /sitemap.xml + /sitemap_index.xml
+       2. /robots.txt -> Sitemap: lines
+       3. /llms.txt + /llms-full.txt
+       4. /mint.json + /docs.json (Mintlify nav)
+       5. Wayback Machine CDX API
+       (BFS crawl runs only if every method above returned zero URLs.)
+
+    Mintlify-style sites often expose manual /pages/* in mint.json while
+    /api-reference/* pages are auto-generated and only visible via Wayback
+    or the sitemap. Unioning catches both.
     """
     parsed = urllib.parse.urlparse(seed_url)
     origin = f"{parsed.scheme}://{parsed.netloc}"
@@ -529,12 +539,22 @@ def discover_urls(seed_url, prefix_only=False, max_pages=DEFAULT_MAX_PAGES,
         prefix = origin + "/"
 
     def _try(label, func):
+        """Run one discovery method, return set of clean URLs (may be empty).
+        Always logs an outcome line so silent failures are visible.
+        """
+        _DISCOVERY_LOG.clear()
         try:
             urls = func()
-        except Exception:
-            return None
+        except Exception as e:
+            print(f"[discover] {label}: error: {e}", file=sys.stderr)
+            return set()
+        # Always surface the per-fetch diagnostics in verbose mode
+        if verbose:
+            for line in _DISCOVERY_LOG:
+                print(f"[discover]   {line}", file=sys.stderr)
         if not urls:
-            return None
+            print(f"[discover] {label}: no URLs returned", file=sys.stderr)
+            return set()
         kept = set()
         skipped_noise = []
         skipped_prefix = []
@@ -547,93 +567,144 @@ def discover_urls(seed_url, prefix_only=False, max_pages=DEFAULT_MAX_PAGES,
                 skipped_noise.append(cu)
                 continue
             kept.add(cu)
-        kept = sorted(kept)
         dropped = len(skipped_noise) + len(skipped_prefix)
-        if kept:
-            extra = f" ({dropped} filtered out)" if dropped else ""
-            print(f"[discover] {label} -> {len(kept)} urls{extra}",
-                  file=sys.stderr)
-            if verbose:
-                for u in skipped_noise:
-                    print(f"[discover]  SKIP noise   {u}", file=sys.stderr)
-                for u in skipped_prefix:
-                    print(f"[discover]  SKIP prefix  {u}", file=sys.stderr)
-            return kept
-        return None
+        extra = f" ({dropped} filtered out)" if dropped else ""
+        print(f"[discover] {label} -> {len(kept)} urls{extra}",
+              file=sys.stderr)
+        if verbose:
+            for u in skipped_noise:
+                print(f"[discover]  SKIP noise   {u}", file=sys.stderr)
+            for u in skipped_prefix:
+                print(f"[discover]  SKIP prefix  {u}", file=sys.stderr)
+        return kept
 
-    # 1. sitemap.xml
+    all_urls = set()
     for sm in ("/sitemap.xml", "/sitemap_index.xml"):
-        r = _try(f"sitemap {sm}", lambda sm=sm: _fetch_sitemap(origin + sm, origin))
-        if r:
-            return r
-
-    # 2. robots.txt with Sitemap: lines
-    r = _try("robots.txt -> sitemap",
-             lambda: _fetch_sitemaps_from_robots(origin))
-    if r:
-        return r
-
-    # 3. llms.txt / llms-full.txt
+        all_urls |= _try(f"sitemap {sm}",
+                         lambda sm=sm: _fetch_sitemap(origin + sm, origin))
+    all_urls |= _try("robots.txt -> sitemap",
+                     lambda: _fetch_sitemaps_from_robots(origin))
     for fname in ("/llms.txt", "/llms-full.txt"):
-        r = _try(fname, lambda fname=fname: _fetch_llms(origin + fname, origin, prefix))
-        if r:
-            return r
-
-    # 4. mint.json / docs.json (Mintlify-style nav config)
+        all_urls |= _try(fname,
+                         lambda fname=fname: _fetch_llms(origin + fname,
+                                                          origin, prefix))
     for fname in ("/mint.json", "/docs.json"):
-        r = _try(fname, lambda fname=fname: _fetch_mintlify(origin + fname, origin))
-        if r:
-            return r
+        all_urls |= _try(fname,
+                         lambda fname=fname: _fetch_mintlify(origin + fname,
+                                                              origin))
+    all_urls |= _try("SPA pages (Next.js __NEXT_DATA__ + Gatsby page-data + HTML)",
+                     lambda: _fetch_spa_pages(origin))
+    all_urls |= _try("Playwright (JS-rendered nav)",
+                     lambda: _fetch_playwright_pages(origin))
+    all_urls |= _try("Wayback Machine CDX",
+                     lambda: _fetch_wayback_cdx(parsed.netloc))
 
-    # 5. Wayback Machine CDX — works for any site that has been crawled
-    r = _try("Wayback Machine CDX",
-             lambda: _fetch_wayback_cdx(parsed.netloc))
-    if r:
-        return r
+    if all_urls:
+        print(f"[discover] union total: {len(all_urls)} unique URLs",
+              file=sys.stderr)
+        return sorted(all_urls)
 
-    # 6. last resort: BFS
-    print(f"[discover] all fast methods failed at {origin}; BFS from {seed_url}",
+    # Last resort: BFS crawl
+    print(f"[discover] no fast methods returned URLs; BFS from {seed_url}",
           file=sys.stderr)
     return bfs_crawl(seed_url, prefix=prefix, max_pages=max_pages)
 
 
+# Per-method outcome ring: appended by each _fetch_* helper.
+# Consumed by discover_urls verbose output.
+_DISCOVERY_LOG = []
+
+def _diag(msg):
+    _DISCOVERY_LOG.append(msg)
+
+
+def _looks_like_html(body):
+    """Detect HTML so we can skip SPA-fallback responses when XML/JSON expected."""
+    if not body:
+        return False
+    head = body[:512].decode("utf-8", errors="ignore").lstrip().lower()
+    return head.startswith("<!doctype html") or head.startswith("<html")
+
+
 def _fetch_sitemap(url, origin):
-    status, _, body = http_get(url)
-    if status != 200 or not body:
+    # Ask for XML explicitly; many CDNs do content negotiation and would
+    # otherwise return the SPA HTML shell.
+    status, _, body = http_get(
+        url, headers={"Accept": "application/xml, text/xml, */*;q=0.5"})
+    if status != 200:
+        _diag(f"{url}: HTTP {status}")
         return []
-    return parse_sitemap(body, origin)
+    if not body:
+        _diag(f"{url}: empty body")
+        return []
+    if _looks_like_html(body):
+        _diag(f"{url}: HTTP 200 but body is HTML (SPA fallback, not sitemap)")
+        return []
+    out = parse_sitemap(body, origin)
+    _diag(f"{url}: HTTP 200, {len(body)} bytes, {len(out)} URLs parsed")
+    return out
 
 
 def _fetch_sitemaps_from_robots(origin):
-    status, _, body = http_get(origin + "/robots.txt")
+    rurl = origin + "/robots.txt"
+    status, _, body = http_get(rurl)
     if status != 200 or not body:
+        _diag(f"{rurl}: HTTP {status}")
         return []
-    urls = []
+    sitemap_lines = []
     for ln in body.decode("utf-8", errors="ignore").splitlines():
         m = re.match(r"(?i)\s*Sitemap:\s*(\S+)", ln)
         if m:
-            try:
-                urls.extend(_fetch_sitemap(m.group(1), origin))
-            except Exception:
-                pass
+            sitemap_lines.append(m.group(1))
+    if not sitemap_lines:
+        _diag(f"{rurl}: 200 but no Sitemap: lines")
+        return []
+    urls = []
+    for sm in sitemap_lines:
+        try:
+            urls.extend(_fetch_sitemap(sm, origin))
+        except Exception as e:
+            _diag(f"{sm}: {e}")
     return urls
 
 
 def _fetch_llms(url, origin, prefix):
-    status, _, body = http_get(url)
-    if status != 200 or not body:
+    # Mintlify and friends serve different responses based on Accept;
+    # ask for plain text / markdown so we don't get the SPA HTML shell.
+    status, _, body = http_get(
+        url, headers={"Accept": "text/plain, text/markdown, */*;q=0.5"})
+    if status != 200:
+        _diag(f"{url}: HTTP {status}")
         return []
-    return parse_llms_txt(body, origin, prefix)
+    if not body:
+        _diag(f"{url}: empty body")
+        return []
+    if _looks_like_html(body):
+        _diag(f"{url}: HTTP 200 but body is HTML (SPA fallback, not llms.txt)")
+        return []
+    out = parse_llms_txt(body, origin, prefix)
+    _diag(f"{url}: HTTP 200, {len(body)} bytes, "
+          f"{len(out)} URLs parsed (prefix={prefix})")
+    return out
 
 
 def _fetch_mintlify(url, origin):
     """Mintlify config files have a `navigation` tree of page slugs. Flatten it."""
-    status, _, body = http_get(url)
-    if status != 200 or not body:
+    status, _, body = http_get(
+        url, headers={"Accept": "application/json, */*;q=0.5"})
+    if status != 200:
+        _diag(f"{url}: HTTP {status}")
+        return []
+    if not body:
+        _diag(f"{url}: empty body")
+        return []
+    if _looks_like_html(body):
+        _diag(f"{url}: HTTP 200 but body is HTML (SPA fallback, not JSON)")
         return []
     try:
         cfg = json.loads(body.decode("utf-8", errors="ignore"))
-    except Exception:
+    except Exception as e:
+        _diag(f"{url}: 200 but JSON parse failed: {e}")
         return []
     pages = []
 
@@ -645,12 +716,201 @@ def _fetch_mintlify(url, origin):
             for x in node:
                 walk(x)
         elif isinstance(node, dict):
-            # common shapes: {"pages":[...]}, {"group":..., "pages":[...]}, {"navigation":{...}}
             for key in ("pages", "navigation", "groups", "tabs", "anchors", "items"):
                 if key in node:
                     walk(node[key])
     walk(cfg)
+    _diag(f"{url}: HTTP 200, {len(body)} bytes, {len(pages)} URLs flattened")
     return pages
+
+
+def _walk_for_paths(node, origin, out):
+    """Recursively collect any string that looks like a site-relative path."""
+    if isinstance(node, str):
+        s = node.strip()
+        if s.startswith("/") and not s.startswith("//") and not s.startswith("/_"):
+            # plain site-absolute path
+            out.add(origin + s.split("#", 1)[0])
+        elif s.startswith(origin):
+            out.add(s.split("#", 1)[0])
+    elif isinstance(node, list):
+        for x in node:
+            _walk_for_paths(x, origin, out)
+    elif isinstance(node, dict):
+        for v in node.values():
+            _walk_for_paths(v, origin, out)
+
+
+def _fetch_spa_pages(origin):
+    """Discover URLs from SPA/Next.js/Gatsby sites that don't expose sitemap
+    or llms files. Strategy:
+      1. __NEXT_DATA__ JSON blob          (Pages Router Next.js)
+      2. self.__next_f.push([n, "..."])   (App Router Next.js / Mintlify v3)
+      3. /page-data/index/page-data.json  (Gatsby)
+      4. Brute-force path-regex sweep of the entire HTML
+    """
+    urls = set()
+
+    # Fetch home page HTML
+    try:
+        status, _, body = http_get(origin + "/")
+    except Exception as e:
+        _diag(f"{origin}/: error {e}")
+        return []
+    if status != 200 or not body:
+        _diag(f"{origin}/: HTTP {status}")
+        return []
+    html = body.decode("utf-8", errors="ignore")
+    _diag(f"{origin}/: HTTP 200, {len(body)} bytes")
+
+    # 1. Pages Router Next.js
+    m = re.search(
+        r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*>(.+?)</script>',
+        html, re.DOTALL)
+    if m:
+        try:
+            data = json.loads(m.group(1))
+            before = len(urls)
+            _walk_for_paths(data, origin, urls)
+            _diag(f"__NEXT_DATA__: +{len(urls) - before} URLs")
+        except Exception as e:
+            _diag(f"__NEXT_DATA__ parse failed: {e}")
+
+    # 2. App Router Next.js — self.__next_f.push payloads carry the React
+    #    tree as a JSON-encoded string. Extract every path-shaped token.
+    payloads = re.findall(
+        r'self\.__next_f\.push\(\s*\[\s*\d+\s*,\s*(["\'])((?:\\.|(?!\1).)*)\1',
+        html, re.DOTALL)
+    if payloads:
+        before = len(urls)
+        for _, payload in payloads:
+            # The payload is a JS string with escaped quotes. We don't need to
+            # un-escape rigorously — paths show up as either "/foo/bar" or
+            # \"/foo/bar\". Match both forms.
+            for pm in re.finditer(r'(?:\\")(/[A-Za-z0-9][\w./-]{3,})(?:\\")',
+                                  payload):
+                p = pm.group(1).split("#", 1)[0].split("?", 1)[0]
+                urls.add(origin + p.rstrip("/"))
+            for pm in re.finditer(r'"(/[A-Za-z0-9][\w./-]{3,})"', payload):
+                p = pm.group(1).split("#", 1)[0].split("?", 1)[0]
+                urls.add(origin + p.rstrip("/"))
+        _diag(f"__next_f payloads ({len(payloads)}): "
+              f"+{len(urls) - before} URLs")
+
+    # 3. Gatsby's root page-data
+    pd_url = origin + "/page-data/index/page-data.json"
+    try:
+        status2, _, body2 = http_get(pd_url)
+        if status2 == 200 and body2 and not _looks_like_html(body2):
+            try:
+                data = json.loads(body2.decode("utf-8", errors="ignore"))
+                before = len(urls)
+                _walk_for_paths(data, origin, urls)
+                _diag(f"{pd_url}: +{len(urls) - before} URLs")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 4. Brute-force path regex over the entire HTML. Catches embedded
+    #    nav in any form we haven't specifically targeted above. The
+    #    is_doc_url filter (run by _try) drops asset paths.
+    before = len(urls)
+    # quoted-path tokens, escaped or not: /pages/foo, /api-reference/bar
+    for pm in re.finditer(r'(?:\\"|")(/[A-Za-z0-9][\w./-]{3,})(?:\\"|")', html):
+        p = pm.group(1).split("#", 1)[0].split("?", 1)[0]
+        # require at least one slash beyond the leading one
+        if p.count("/") >= 2:
+            urls.add(origin + p.rstrip("/"))
+    if len(urls) > before:
+        _diag(f"path-regex sweep: +{len(urls) - before} URLs "
+              f"(total {len(urls)})")
+
+    # 5. <a href="..."> as a final pass
+    before = len(urls)
+    for mm in re.finditer(r'href=["\']([^"\']+)["\']', html):
+        href = mm.group(1).split("#", 1)[0]
+        if href.startswith("/") and not href.startswith("//"):
+            urls.add(origin + href)
+        elif href.startswith(origin):
+            urls.add(href)
+    if len(urls) > before:
+        _diag(f"anchor hrefs: +{len(urls) - before} URLs")
+
+    _diag(f"spa pages total raw: {len(urls)}")
+    return sorted(urls)
+
+
+def _fetch_playwright_pages(origin):
+    """Headless-browser discovery for JS-rendered SPAs (Mintlify v3,
+    Next.js App Router, Gatsby, Docusaurus). Renders the home page,
+    waits for hydration, clicks every visible nav toggle to expand
+    collapsed sections, then extracts every <a href> from the live DOM.
+    Falls through silently if Playwright isn't installed.
+    """
+    if not HAVE_PLAYWRIGHT:
+        _diag("playwright: not installed (pip install playwright && "
+              "playwright install chromium)")
+        return []
+
+    urls = set()
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            try:
+                ctx = browser.new_context(user_agent=USER_AGENT)
+                page = ctx.new_page()
+                page.goto(origin + "/", wait_until="networkidle",
+                          timeout=30000)
+                # Give React time to fully hydrate after networkidle
+                page.wait_for_timeout(1500)
+
+                # First pass: hrefs visible without expanding anything
+                hrefs = page.evaluate(
+                    "() => Array.from(document.querySelectorAll('a[href]'))"
+                    "       .map(a => a.href)")
+                for h in hrefs:
+                    if h.startswith(origin):
+                        urls.add(h.split("#", 1)[0])
+                    elif h.startswith("/") and not h.startswith("//"):
+                        urls.add(origin + h.split("#", 1)[0])
+                first = len(urls)
+                _diag(f"playwright initial render: {len(hrefs)} anchors, "
+                      f"{first} internal URLs")
+
+                # Expand collapsed nav: Mintlify uses <button aria-expanded="false">
+                # inside <nav>. Click each (best-effort) and re-extract.
+                try:
+                    page.evaluate(
+                        "() => { document.querySelectorAll('nav button,"
+                        " [role=\"button\"], summary')"
+                        "          .forEach(b => { try { b.click(); } catch(e){} }); }")
+                    page.wait_for_timeout(1500)
+                    hrefs2 = page.evaluate(
+                        "() => Array.from(document.querySelectorAll('a[href]'))"
+                        "       .map(a => a.href)")
+                    added = 0
+                    for h in hrefs2:
+                        if h.startswith(origin):
+                            u = h.split("#", 1)[0]
+                            if u not in urls:
+                                urls.add(u)
+                                added += 1
+                        elif h.startswith("/") and not h.startswith("//"):
+                            u = origin + h.split("#", 1)[0]
+                            if u not in urls:
+                                urls.add(u)
+                                added += 1
+                    _diag(f"playwright after nav-expand: +{added} URLs "
+                          f"(total {len(urls)})")
+                except Exception as e:
+                    _diag(f"playwright nav-expand failed: {e}")
+            finally:
+                browser.close()
+    except Exception as e:
+        _diag(f"playwright error: {e}")
+        return []
+    return sorted(urls)
 
 
 def _fetch_wayback_cdx(netloc):
@@ -662,7 +922,7 @@ def _fetch_wayback_cdx(netloc):
     api = (
         "https://web.archive.org/cdx/search/cdx"
         f"?url={urllib.parse.quote(netloc)}/*"
-        "&output=json&fl=original&collapse=urlkey&filter=statuscode:200&limit=5000"
+        "&output=json&fl=original&collapse=urlkey&filter=statuscode:200&limit=20000"
     )
     status, _, body = http_get(api)
     if status != 200 or not body:
@@ -685,15 +945,22 @@ def _fetch_wayback_cdx(netloc):
 def parse_llms_txt(body, origin, prefix):
     """Extract URLs from an llms.txt / llms-full.txt file.
 
-    Format is roughly markdown with bullet lists of links like:
-        - [Title](https://docs.example.com/path)
-    or just raw URLs, one per line. We accept both.
+    Accepts:
+      - [Title](https://docs.example.com/path)   absolute markdown link
+      - [Title](/pages/foo)                      relative markdown link
+      - https://docs.example.com/path            bare URL line
     """
     text = body.decode("utf-8", errors="ignore")
     urls = set()
-    # markdown-style links
-    for m in re.finditer(r"\]\((https?://[^\s\)]+)\)", text):
-        u = m.group(1).split("#", 1)[0]
+    # markdown-style links — both absolute and relative paths
+    for m in re.finditer(r"\]\(\s*([^)\s]+)\s*\)", text):
+        href = m.group(1).strip()
+        if href.startswith(("http://", "https://")):
+            u = href.split("#", 1)[0]
+        elif href.startswith("/"):
+            u = origin + href.split("#", 1)[0]
+        else:
+            continue
         if u.startswith(prefix):
             urls.add(u)
     # bare URLs on their own line
@@ -888,21 +1155,23 @@ def _fetch_one(url, prev_etag, prev_lm, force):
 
 def cmd_sync(args):
     conn = open_db()
+    seeds_urls = []
     if getattr(args, "seeds_file", None):
         with open(args.seeds_file) as fh:
-            urls = [ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")]
-        print(f"[sync] {len(urls)} URLs loaded from {args.seeds_file}", file=sys.stderr)
-    elif args.urls and not args.seed:
-        urls = list(args.urls)
-        print(f"[sync] using {len(urls)} explicit URLs", file=sys.stderr)
-    else:
+            seeds_urls = [ln.strip() for ln in fh
+                          if ln.strip() and not ln.startswith("#")]
+        print(f"[sync] {len(seeds_urls)} URLs loaded from {args.seeds_file}",
+              file=sys.stderr)
+
+    discovered_urls = []
+    if args.urls and not args.seed:
+        discovered_urls = list(args.urls)
+        print(f"[sync] using {len(discovered_urls)} explicit URLs", file=sys.stderr)
+    elif args.seed:
         seed = args.seed
-        if not seed:
-            print("error: sync needs a seed URL (or --urls)", file=sys.stderr)
-            return 2
         if not seed.startswith(("http://", "https://")):
             seed = "https://" + seed
-        urls = discover_urls(seed, prefix_only=args.prefix_only,
+        discovered_urls = discover_urls(seed, prefix_only=args.prefix_only,
                              max_pages=args.max_pages,
                              verbose=getattr(args, "verbose", False))
         host = urllib.parse.urlparse(seed).netloc
@@ -912,8 +1181,18 @@ def cmd_sync(args):
             (f"seed:{host}", seed),
         )
         conn.commit()
+
+    # Union seeds-file + discovery, canonicalize, dedupe
+    urls = sorted({canonicalize_url(u)
+                   for u in (seeds_urls + discovered_urls) if u})
+    if seeds_urls and discovered_urls:
+        print(f"[sync] union: {len(seeds_urls)} seeds + "
+              f"{len(discovered_urls)} discovered -> {len(urls)} unique",
+              file=sys.stderr)
+
     if not urls:
-        print("[sync] no URLs discovered", file=sys.stderr)
+        print("[sync] no URLs to index (provide a seed URL or --seeds-file)",
+              file=sys.stderr)
         return 1
     workers = max(1, args.workers)
     print(f"[sync] {len(urls)} pages to consider, {workers} workers", file=sys.stderr)
