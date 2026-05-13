@@ -233,6 +233,91 @@ def html_to_markdown(body):
     return text, title
 
 
+def clean_mintlify_mdx(md):
+    """Strip Mintlify-specific MDX components and convert to clean markdown.
+    Reduces verbosity and removes JSX-style tags that confuse LLMs.
+
+    Transforms:
+      <Note>x</Note> / <Info>x</Info> / <Warning>x</Warning>  -> blockquote
+      <ParamField body="X" type="Y" required>desc</ParamField> -> - **X** (Y, required) -- desc
+      <CodeGroup>...</CodeGroup> -> just the inner code blocks
+      ```bash Sample request theme={null} -> ```bash
+      Drops the duplicate "Response structure" placeholder block following
+      a "Sample response" block.
+    """
+    if not md:
+        return md
+
+    # Strip theme={...} (and similar prop) from code fence info strings.
+    md = re.sub(r"(^```[^\n]*)\s+theme=\{[^}]*\}", r"\1", md, flags=re.M)
+    # Strip any other JSX-style {...} props on the fence line.
+    md = re.sub(r"(^```[a-zA-Z0-9_+-]*[^\n]*?)\s+\{[^}]*\}",
+                lambda m: re.sub(r"\s+\{[^}]*\}", "", m.group(0)),
+                md, flags=re.M)
+    # Normalize code fence info strings: keep just "```<lang>" and an
+    # optional descriptive caption that follows the language.
+    # (e.g. "```bash Sample request" -> "```bash") -- agents rarely need
+    # the caption, and it clutters tool output.
+    md = re.sub(r"^```([a-zA-Z0-9_+-]+)[ \t]+[^\n]+$",
+                r"```\1", md, flags=re.M)
+
+    # <Note>/<Info>/<Tip>/<Warning>/<Check>/<Danger> blocks -> blockquote
+    def callout_to_blockquote(m):
+        kind = m.group(1).capitalize()
+        body = m.group(2).strip()
+        body = re.sub(r"\n", "\n> ", body)
+        return f"> **{kind}:** {body}"
+    md = re.sub(
+        r"<(Note|Info|Tip|Warning|Check|Danger|Caution)>([\s\S]*?)</\1>",
+        callout_to_blockquote, md)
+
+    # <ParamField body="name" type="..." [required]>desc</ParamField>
+    # -> - **name** (type[, required]) -- desc
+    def paramfield_to_li(m):
+        attrs = m.group(1)
+        body = m.group(2).strip()
+        name = re.search(r'body=["\']([^"\']+)["\']', attrs)
+        typ  = re.search(r'type=["\']([^"\']+)["\']', attrs)
+        req  = " required" in attrs.lower() and not re.search(r'required=["\']false["\']', attrs)
+        name_s = name.group(1) if name else "?"
+        typ_s  = typ.group(1) if typ else ""
+        meta   = typ_s + (", required" if req else "")
+        meta_p = f" ({meta})" if meta else ""
+        # Collapse multi-line bodies to a single line, keep prose tight
+        body = re.sub(r"\s+", " ", body)
+        return f"- **{name_s}**{meta_p} — {body}"
+    md = re.sub(
+        r"<ParamField\b([^>]*)>([\s\S]*?)</ParamField>",
+        paramfield_to_li, md)
+
+    # <ResponseField> mirrors ParamField in newer Mintlify
+    md = re.sub(
+        r"<ResponseField\b([^>]*)>([\s\S]*?)</ResponseField>",
+        paramfield_to_li, md)
+
+    # <CodeGroup>...</CodeGroup>: drop the wrapper, keep inner blocks.
+    md = re.sub(r"<CodeGroup>\s*", "", md)
+    md = re.sub(r"\s*</CodeGroup>", "", md)
+
+    # <Card>, <Steps>, <Step>, <Tabs>, <Tab>, <Frame>, <Accordion> wrappers:
+    # remove opening/closing tags, keep inner content.
+    for tag in ("Card", "Cards", "Steps", "Step", "Tabs", "Tab", "Frame",
+                "Accordion", "AccordionGroup", "Expandable", "Columns",
+                "Column", "Section", "Update"):
+        md = re.sub(rf"</?{tag}\b[^>]*>", "", md)
+
+    # Drop "Response structure" placeholder blocks that immediately follow
+    # a "Sample response" block — they're shape-only duplicates.
+    md = re.sub(
+        r"(```json\s+Sample response[\s\S]*?```)\s*```json\s+Response structure[\s\S]*?```",
+        r"\1", md)
+
+    # Tidy: collapse 3+ blank lines and strip trailing whitespace.
+    md = re.sub(r"\n{3,}", "\n\n", md)
+    md = re.sub(r"[ \t]+\n", "\n", md)
+    return md.strip()
+
+
 def split_markdown_sections(md, page_title):
     """Split a markdown document into sections at # / ## / ### boundaries.
     Returns list of {heading_path, heading, content, seq}.
@@ -1116,7 +1201,7 @@ def _fetch_one(url, prev_etag, prev_lm, force):
         except Exception:
             status_md, resp_md, body_md = 0, {}, b""
         if status_md == 200 and body_md and _looks_like_markdown(body_md):
-            md_text = body_md.decode("utf-8", errors="ignore")
+            md_text = clean_mintlify_mdx(body_md.decode("utf-8", errors="ignore"))
             title = _md_title(md_text)
             sections = split_markdown_sections(md_text, title)
             parsed = urllib.parse.urlparse(url)
@@ -1140,6 +1225,7 @@ def _fetch_one(url, prev_etag, prev_lm, force):
     if status != 200:
         return {"url": url, "error": f"HTTP {status}"}
     md_text, title = html_to_markdown(body)
+    md_text = clean_mintlify_mdx(md_text)
     sections = split_markdown_sections(md_text, title)
     parsed = urllib.parse.urlparse(url)
     return {
@@ -1869,6 +1955,15 @@ def cmd_mcp(args):
 
 
 def main(argv=None):
+    # Windows console defaults to cp1252 which can't encode many docs chars
+    # (<=, =>, en-dash, arrows, emoji). Force UTF-8 on stdout/stderr so cat,
+    # search, etc. never crash on non-Latin-1 characters.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
     p = argparse.ArgumentParser(prog="docs-index", description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
 
