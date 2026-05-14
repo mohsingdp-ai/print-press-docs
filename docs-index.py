@@ -2308,7 +2308,21 @@ def main(argv=None):
     pm.set_defaults(func=cmd_mcp)
 
     args = p.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except BrokenPipeError:
+        # Downstream pipe closed (e.g. `cat ... | head`, `| grep -m1`).
+        # Standard Unix tools exit silently on SIGPIPE; do the same here so
+        # piped use of search/cat/tree/urls doesn't dump a Python traceback.
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        try:
+            sys.stderr.close()
+        except Exception:
+            pass
+        return 0
 
 
 if __name__ == "__main__":
