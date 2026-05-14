@@ -6,14 +6,20 @@ read, and serve it to Claude via MCP — without re-fetching, without
 context blowup, without an embeddings provider.
 
 - **Generic** — works with Mintlify, Docusaurus, Gatsby, GitBook, plain HTML.
-- **Section-level search** — FTS5 returns the matched section's full
-  markdown, not a 12-word snippet, so one query usually answers.
+- **Filesystem-shaped read API (MCP)** — `ls` walks the path tree, `cat`
+  reads one page. No search tool. Navigate top-down; path segments
+  self-describe on real docs sites.
+- **Section-level FTS5 (CLI)** — the `search` CLI command returns the
+  matched section's full markdown, not a 12-word snippet, so one query
+  usually answers. (Kept as a CLI convenience; intentionally not exposed
+  via MCP.)
 - **Markdown-native storage** — prefers `<url>.md` source when the platform
   publishes it; otherwise converts HTML to markdown via `html2text`.
 - **Cheap to keep fresh** — `ETag` / `Last-Modified` incremental sync, plus
   background auto-sync of stale sites on next read.
-- **MCP server** — exposes 11 tools so an MCP-aware client (Claude desktop,
-  Claude Code, etc.) can search and curate the index inside a conversation.
+- **MCP server** — exposes 7 tools so an MCP-aware client (Claude desktop,
+  Claude Code, etc.) can navigate the index as a filesystem (`ls` + `cat`)
+  inside a conversation. No search tool by design — drill down by path.
 
 ## Quick start
 
@@ -89,35 +95,47 @@ to `claude_desktop_config.json` (location: `%APPDATA%\Claude\` on Windows,
 }
 ```
 
-Restart Claude. **11 tools** appear:
+Restart Claude. **7 tools** appear:
 
 ```
-search_docs       cat_doc           list_sites        list_pages
-sync_site         clear_site        prune_index       index_stats
-get_active_docs   set_active_docs   help
+ls            cat            sync_site     clear_site
+prune_index   index_stats    help
 ```
 
-Call `help` once at the start of any session for the orchestration
-playbook (workflows, filter precedence, FTS5 syntax, common pitfalls).
+Read tools (`ls`, `cat`) treat the index as a filesystem:
+
+```
+ls("/")                                     -> indexed sites
+ls("/docs.foo.com/")                        -> top-level structure of one site
+ls("/docs.foo.com/api-reference/")          -> drill into a subtree
+cat("/docs.foo.com/api-reference/foo")      -> read a page
+```
+
+There is no search tool — navigate top-down by path. Path segments in
+real docs sites self-describe (e.g. `/api-reference/onboarding/respond-to-an-information-request`),
+which is usually enough to find the right leaf in 2-3 hops. Call `help`
+once at the start of any session for the orchestration playbook.
 
 Typical agent flow:
 
-> Set docs.stripe.com as the active docs.
-> What's the right way to verify a webhook signature?
+> What's the right way to verify a webhook signature in the Equals API?
 
-The agent calls `set_active_docs("docs.stripe.com")`, then `search_docs("verify webhook signature")`, and answers from the returned section's full markdown — no follow-up needed.
+The agent calls `ls("/")` to see what's indexed, `ls("/docs.equalsmoney.com/pages/webhooks/")` to find the relevant section, and `cat("/docs.equalsmoney.com/pages/webhooks/create-webhooks")` to read the answer.
 
 ## How it stays cheap on context
 
 - Stored content is **extracted markdown only** (script / style / nav /
   header / footer / aside / svg / sidebar / toc / feedback widgets are
   stripped at ingest, by tag, role, class, and id).
-- Search returns ranked **section excerpts**, not whole pages. The full
-  page only enters context when you `cat` it.
+- `ls` returns just the immediate children of a path — directory names
+  and one-line page titles — never page bodies. The full page only
+  enters context when you `cat` it.
+- `ls` derives directories from the path tree on the fly; no synthetic
+  TOC pages to maintain, nothing to regenerate at sync time.
 - Re-sync sends `If-None-Match` / `If-Modified-Since` per page — most of
   a weekly refresh is 304s.
-- Section-level FTS5 with `bm25` ranking gives precise hits without
-  embeddings.
+- CLI `search` (kept for terminal use) returns ranked section excerpts,
+  not whole pages, via FTS5 + `bm25`. Not exposed via MCP by design.
 
 ## Storage
 

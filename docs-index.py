@@ -33,7 +33,8 @@ Maintenance:
   docs-index reset [--yes]               # wipe the entire index
 
 Serving to Claude / agents:
-  docs-index mcp                         # stdio MCP server (12 tools)
+  docs-index mcp                         # stdio MCP server: ls, cat, sync_site,
+                                         # clear_site, prune_index, index_stats, help
 
 Storage:  ~/.docs-index/index.db
 Optional deps:  beautifulsoup4 (better HTML cleanup), html2text (HTML->md
@@ -1644,83 +1645,265 @@ def cmd_stats(args):
     return 0
 
 
+# ---------- MCP ls/cat helpers (filesystem view over the index) ----------
+
+def _parse_ls_path(path):
+    """Parse an ls path argument into (host, prefix).
+
+    host    None for root (list sites)
+    prefix  '' for site root, else '/segment/segment' (no trailing slash)
+
+    Examples:
+        None or '/'                               -> (None, '')
+        '/docs.foo.com'    or '/docs.foo.com/'    -> ('docs.foo.com', '')
+        '/docs.foo.com/api-reference/'            -> ('docs.foo.com', '/api-reference')
+        'docs.foo.com/api-reference/cards'        -> ('docs.foo.com', '/api-reference/cards')
+    """
+    if not path:
+        return None, ""
+    p = path.strip()
+    if not p or p == "/":
+        return None, ""
+    p = p.lstrip("/").rstrip("/")
+    if not p:
+        return None, ""
+    parts = p.split("/", 1)
+    host = parts[0]
+    prefix = ("/" + parts[1].rstrip("/")) if len(parts) > 1 and parts[1] else ""
+    return host, prefix
+
+
+def _parse_cat_target(target):
+    """Parse a cat path into (host, page_path, full_url). Any field may be None.
+
+    Accepts:
+      - Full URL                    https://docs.foo.com/x/y -> (host, /x/y, url)
+      - Filesystem path             /docs.foo.com/x/y        -> (host, /x/y, None)
+      - Bare path under one site    /api-reference/foo       -> (None, /api-reference/foo, None)
+      - Bare token (fuzzy)          respond-to-info-request  -> (None, None, None)
+    """
+    if not target:
+        return None, None, None
+    t = target.strip()
+    if "://" in t:
+        u = urllib.parse.urlparse(t)
+        return u.netloc, (u.path or "/"), t
+    if t.startswith("/"):
+        body = t.lstrip("/")
+        if "/" in body:
+            head, rest = body.split("/", 1)
+            if "." in head:  # looks like a host
+                return head, "/" + rest.rstrip("/"), None
+        else:
+            head = body
+            if "." in head:
+                return head, "/", None
+        return None, t.rstrip("/"), None
+    return None, None, None
+
+
+def _ls_root(conn):
+    rows = conn.execute(
+        "SELECT host, COUNT(*) AS pages, MAX(fetched_at) AS last_seen "
+        "FROM pages GROUP BY host ORDER BY host"
+    ).fetchall()
+    out = ["# / (indexed sites)", ""]
+    if not rows:
+        out.append("(empty — call `sync_site` to index a docs URL)")
+        return "\n".join(out)
+    for r in rows:
+        last = (r["last_seen"] or "")[:10]
+        out.append(f"- `{r['host']}/`   {r['pages']:>4} pages   (synced {last})")
+    out.append("")
+    out.append("Drill in with `ls /<host>/`.")
+    return "\n".join(out)
+
+
+def _ls_subtree(conn, host, prefix):
+    """List the immediate children of `prefix` within `host`.
+
+    A path segment may be both a directory (has descendants) and a file
+    (the prefix itself is an indexed page). Renders both kinds.
+    """
+    if prefix:
+        rows = conn.execute(
+            "SELECT path, title FROM pages "
+            "WHERE host = ? AND (path = ? OR path LIKE ?) "
+            "ORDER BY path",
+            (host, prefix, prefix + "/%"),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT path, title FROM pages WHERE host = ? ORDER BY path",
+            (host,),
+        ).fetchall()
+
+    if not rows:
+        return (
+            f"# /{host}{prefix}/\n\n"
+            "(no pages here — try `ls /` to see what's indexed, or `ls "
+            f"/{host}/` for this site's top level)\n"
+        )
+
+    self_page = None
+    children = {}  # seg -> {"is_leaf": bool, "leaf_title": str|None, "subpages": int}
+    base = prefix  # '' or '/segment/...'
+
+    for r in rows:
+        p = r["path"]
+        if p == base or (base == "" and p in ("/", "")):
+            self_page = {"path": p or "/", "title": r["title"]}
+            continue
+        if base:
+            tail = p[len(base) + 1:] if p.startswith(base + "/") else p[len(base):].lstrip("/")
+        else:
+            tail = p.lstrip("/")
+        if not tail:
+            continue
+        seg, _, rest = tail.partition("/")
+        is_leaf_here = (rest == "")
+        c = children.setdefault(
+            seg, {"is_leaf": False, "leaf_title": None, "subpages": 0}
+        )
+        if is_leaf_here:
+            c["is_leaf"] = True
+            c["leaf_title"] = r["title"]
+        else:
+            c["subpages"] += 1
+
+    dirs, files = [], []
+    for seg in sorted(children.keys()):
+        c = children[seg]
+        if c["is_leaf"] and c["subpages"] == 0:
+            files.append((seg, c["leaf_title"]))
+        elif c["subpages"] > 0:
+            dirs.append((seg, c["subpages"], c["leaf_title"] if c["is_leaf"] else None))
+        else:
+            files.append((seg, c["leaf_title"]))
+
+    header_path = f"/{host}{base}/"
+    out = [f"# {header_path}", ""]
+    if dirs:
+        out.append("## Directories")
+        for seg, count, leaf_title in dirs:
+            extra = f"   (also a page: \"{leaf_title}\")" if leaf_title else ""
+            out.append(f"- `{seg}/`   {count:>4} pages{extra}")
+        out.append("")
+    if files:
+        out.append("## Pages")
+        for seg, title in files:
+            out.append(f"- `{seg}`   {title or '(untitled)'}")
+        out.append("")
+    if self_page:
+        cat_path = f"/{host}{self_page['path']}".replace("//", "/")
+        out.append(
+            f"_This prefix is itself a page — "
+            f"`cat {cat_path}` to read \"{self_page['title'] or '(untitled)'}\"._"
+        )
+    return "\n".join(out).rstrip() + "\n"
+
+
+def _cat_lookup(conn, raw):
+    """Return a pages row matching the cat target, trying exact then fuzzy."""
+    host, page_path, full_url = _parse_cat_target(raw)
+    candidates = []
+    if full_url:
+        candidates.append(("url = ?", (full_url,)))
+    if host and page_path:
+        candidates.append(
+            ("host = ? AND (path = ? OR path = ?)",
+             (host, page_path, page_path.rstrip("/"))),
+        )
+    if page_path and not host:
+        candidates.append(
+            ("(path = ? OR path = ?)",
+             (page_path, page_path.rstrip("/"))),
+        )
+    for where, params in candidates:
+        row = conn.execute(
+            f"SELECT host,path,title,url,content,fetched_at FROM pages "
+            f"WHERE {where} LIMIT 1",
+            params,
+        ).fetchone()
+        if row:
+            return row
+    # Fuzzy fallback — substring on path; shortest match wins
+    needle = (raw or "").strip().lstrip("/").rstrip("/")
+    if needle:
+        return conn.execute(
+            "SELECT host,path,title,url,content,fetched_at FROM pages "
+            "WHERE path LIKE ? ORDER BY length(path) LIMIT 1",
+            (f"%{needle}%",),
+        ).fetchone()
+    return None
+
+
 MCP_ORCHESTRATION_GUIDE = """\
-docs-index MCP — local search over any docs site, sectioned and markdown-native.
+docs-index MCP — indexed docs exposed as a navigable filesystem.
 
 ==============================
-WORKFLOWS (when to use what)
+WORKFLOWS
 ==============================
 
-1) ANSWERING A QUESTION ABOUT A SPECIFIC DOC SITE
-   set_active_docs(site="docs.foo.com")        # sticky; survives across calls
-   search_docs(query="<terms>")                 # returns ranked SECTIONS
-       returns: [{ host, path, page_title, heading, heading_path,
-                   section_content, snip, url, score }, ...]
-   The full matched section's markdown is in `section_content`, so you can
-   usually answer without a follow-up cat_doc. Use cat_doc only when you
-   need siblings of the matched section or the entire page.
+1) ANSWER A QUESTION FROM AN INDEXED DOC SITE
+   ls("/")                                       # see indexed sites
+   ls("/docs.foo.com/")                          # top-level structure
+   ls("/docs.foo.com/api-reference/")            # drill into a subtree
+   cat("/docs.foo.com/api-reference/foo")        # read the leaf page
 
-2) BROWSING / ORIENTATION
-   list_sites()                                 # which hosts are indexed
-   list_pages(site=..., path_prefix="/api-reference")
-   index_stats()                                # total counts + last sync time
+2) ADD A NEW DOC SITE
+   sync_site(url="https://docs.bar.com/")        # 10-60s for typical sites
+   ls("/docs.bar.com/")                          # browse what landed
 
-3) ADD A NEW DOCS SITE
-   sync_site(url="https://docs.bar.com/")       # 10-60s for a typical site
-   The tool returns counts; search/cat work immediately after it completes.
+3) REFRESH STALE DOCS
+   sync_site is also the refresh — re-runs send ETag / Last-Modified per
+   page and return counts of new/updated/304/failed.
 
-4) REFRESH STALE DOCS
-   sync_site is also the refresh — re-running fetches only changed pages
-   via ETag/Last-Modified. Stale sites (>7 days) trigger a background
-   re-sync automatically the next time search_docs hits them, so you
-   usually do not need to call this yourself.
+4) RESET A SITE
+   clear_site(site="docs.foo.com")
+   sync_site(url="https://docs.foo.com/")
 
-5) RESET ONE SITE
-   clear_site(site="docs.foo.com")              # wipes pages + sections
-   sync_site(url="https://docs.foo.com/")       # rebuild clean
-
-6) CLEAN NOISE FROM A LEGACY INDEX
-   prune_index()                                # rarely needed; safe to skip
+5) MAINTENANCE
+   index_stats()                                  # totals + freshness
+   prune_index()                                  # rarely needed
 
 ==============================
-FILTER PRECEDENCE
+PATH FORMAT
 ==============================
 
-For search_docs / cat_doc / list_pages, the host filter is resolved as:
-    explicit `site` arg  >  `all_sites=true` (clears)  >  active_site  >  no filter
+Paths are filesystem-style:
+   /                                 = list sites
+   /<host>/                          = top of one site (e.g. /docs.foo.com/)
+   /<host>/<segment>/<segment>/...   = drill in
+   /<host>/<segment>                 = a page (cat target)
 
-Default = active site if set, else no filter (cross-site).
+cat also accepts full URLs (https://docs.foo.com/x) and bare paths
+(/api-reference/foo, falls through to a substring fuzzy match if no
+exact path resolves).
 
 ==============================
-FTS5 QUERY SYNTAX
+NO SEARCH BY DESIGN
 ==============================
 
-search_docs queries are FTS5. Supports:
-    "rate limit"           exact phrase
-    webhook OR signature   either term
-    webhook NOT card       boolean
-    auth*                  prefix
-    NEAR(a b, 10)          a and b within 10 tokens
+This MCP intentionally has no search tool. Use ls to walk the tree
+top-down — path segments self-describe (e.g.
+/api-reference/onboarding/respond-to-an-information-request). Pick a
+branch, drill in, cat the leaf. If a directory's overview page exists
+(it's both a folder AND a leaf), ls notes the overview at the bottom.
 
 ==============================
 COMMON PITFALLS
 ==============================
 
-- After sync_site, future calls "just work" — no separate "reload" tool.
-- set_active_docs sticks in the local DB; remember to call it with empty
-  site to clear if the user switches topics across vendors.
-- search_docs section_content is already the full section. Don't reflexively
-  cat_doc the URL; that's only needed for adjacent content.
-- If list_sites is empty, call sync_site first; nothing else will work.
-- All read tools are cheap; favour calling search_docs + skim over one
-  giant cat_doc.
+- After sync_site, future calls "just work" — no separate "reload".
+- If ls("/") is empty, call sync_site first; nothing else will work.
+- Don't reflexively cat the first plausible match — drill via ls first;
+  one cat at the right leaf beats three cats at wrong ones.
 
 ==============================
 TOOL INVENTORY
 ==============================
-search_docs   cat_doc   list_sites   list_pages   index_stats
-sync_site     clear_site   prune_index
-get_active_docs   set_active_docs (pass site="" to clear)   help
+ls   cat   sync_site   clear_site   prune_index   index_stats   help
 """
 
 
@@ -1737,55 +1920,37 @@ def cmd_mcp(args):
         sys.stdout.flush()
 
     tools = [
-        {"name": "search_docs",
-         "description": "FTS5 search over the local docs index. Optional site filter.",
+        {"name": "ls",
+         "description": "List a directory in the docs filesystem. Pass `/` to see indexed sites, `/host/` to see one site's top level, or `/host/segment/segment/` to drill in. Returns directories (subtrees) and pages (cat targets). No search — navigate top-down by path. Path segments in real docs sites self-describe (e.g. `/api-reference/onboarding/respond-to-an-information-request`).",
          "inputSchema": {"type": "object",
-                          "properties": {"query": {"type": "string"},
-                                          "site":  {"type": "string"},
-                                          "limit": {"type": "integer", "default": 10}},
-                          "required": ["query"]}},
-        {"name": "cat_doc",
-         "description": "Return the full text of one indexed page.",
+                          "properties": {"path": {"type": "string",
+                                                    "description": "filesystem-style path; defaults to '/'",
+                                                    "default": "/"}}}},
+        {"name": "cat",
+         "description": "Return the full markdown of one indexed page. Accepts a filesystem-style path (`/host/segment/page`), a full URL (`https://docs.foo.com/x`), or a bare path; falls back to a substring fuzzy match if the exact path doesn't resolve.",
          "inputSchema": {"type": "object",
-                          "properties": {"path_or_url": {"type": "string"},
-                                          "site":        {"type": "string"}},
-                          "required": ["path_or_url"]}},
-        {"name": "list_sites",
-         "description": "List every host indexed locally with page counts.",
-         "inputSchema": {"type": "object", "properties": {}}},
-        {"name": "list_pages",
-         "description": "Enumerate indexed pages. Use when search misses or you want to browse a section. Filter by site and/or path_prefix; results sorted by path. Returns up to `limit` rows.",
-         "inputSchema": {"type": "object",
-                          "properties": {"site":        {"type": "string"},
-                                          "path_prefix": {"type": "string", "description": "e.g. /api-reference/cards"},
-                                          "limit":       {"type": "integer", "default": 200}}}},
+                          "properties": {"path": {"type": "string",
+                                                    "description": "page path or URL"}},
+                          "required": ["path"]}},
         {"name": "sync_site",
          "description": "Index a new docs URL (or re-sync an existing one) into the local store. Long-running: 10-60s for a typical docs site. Returns counts of new/updated/unchanged/failed pages.",
          "inputSchema": {"type": "object",
                           "properties": {"url":     {"type": "string", "description": "seed URL, e.g. https://docs.stripe.com/"},
                                           "workers": {"type": "integer", "default": 16}},
                           "required": ["url"]}},
+        {"name": "clear_site",
+         "description": "Delete every indexed page and section for one host. Other sites and settings untouched. Pair with sync_site for a clean re-index.",
+         "inputSchema": {"type": "object",
+                          "properties": {"site": {"type": "string"}},
+                          "required": ["site"]}},
         {"name": "prune_index",
          "description": "Clean the local index: drop noise rows (assets, login intercepts, page-data plumbing) and merge trailing-slash duplicates into canonical URLs. Use when the index looks polluted.",
          "inputSchema": {"type": "object", "properties": {}}},
         {"name": "index_stats",
          "description": "Aggregate counts and freshness of the local index: total sites, total pages, db file size, last-sync timestamp.",
          "inputSchema": {"type": "object", "properties": {}}},
-        {"name": "get_active_docs",
-         "description": "Return the currently active docs site (the default filter for search_docs/cat_doc/list_pages when no `site` is passed). Returns null if not set.",
-         "inputSchema": {"type": "object", "properties": {}}},
-        {"name": "set_active_docs",
-         "description": "Set or clear the active docs site (default filter for search/cat/list). Pass `site` as the host (docs.foo.com) or URL to set, or as empty string / null to clear.",
-         "inputSchema": {"type": "object",
-                          "properties": {"site": {"type": "string"}},
-                          "required": ["site"]}},
-        {"name": "clear_site",
-         "description": "Delete every indexed page and section for one host. Other sites and settings untouched. Pair with sync_site for a clean re-index.",
-         "inputSchema": {"type": "object",
-                          "properties": {"site": {"type": "string"}},
-                          "required": ["site"]}},
         {"name": "help",
-         "description": "Return a usage + orchestration guide for this MCP. Call this first if you're unsure which tool to use or how to chain them. Returns workflows, filter precedence, and common pitfalls.",
+         "description": "Return a usage + orchestration guide for this MCP. Call this first if you're unsure which tool to use or how to chain them. Returns workflows, the path format, and common pitfalls.",
          "inputSchema": {"type": "object", "properties": {}}},
     ]
 
@@ -1812,73 +1977,31 @@ def cmd_mcp(args):
             name = params.get("name")
             a = params.get("arguments") or {}
             try:
-                if name == "search_docs":
-                    sql = (
-                        "SELECT p.host,p.path,p.title AS page_title,p.url,"
-                        "s.heading,s.heading_path,s.content AS section_content,"
-                        "snippet(sections_fts,1,'<<','>>','...',30) AS snip "
-                        "FROM sections_fts "
-                        "JOIN sections s ON s.id = sections_fts.rowid "
-                        "JOIN pages p ON p.url = s.page_url "
-                        "WHERE sections_fts MATCH ? ")
-                    qp = [a["query"]]
-                    site_filter = a.get("site") or get_active_site(conn)
-                    if a.get("all_sites"):
-                        site_filter = None
-                    if site_filter:
-                        sql += "AND p.host=? "
-                        qp.append(site_filter)
+                if name == "ls":
+                    target = a.get("path", "/")
+                    host, prefix = _parse_ls_path(target)
+                    if host is None:
+                        text_payload = _ls_root(conn)
+                    else:
                         try:
-                            maybe_auto_sync(conn, site_filter)
+                            maybe_auto_sync(conn, host)
                         except Exception:
                             pass
-                    sql += "ORDER BY bm25(sections_fts) LIMIT ?"
-                    qp.append(a.get("limit", 10))
-                    rows = conn.execute(sql, qp).fetchall()
-                    # Render hits as readable markdown so the agent doesn't
-                    # have to un-escape JSON \n on every line.
-                    if not rows:
-                        text_payload = "(no matches)"
-                    else:
-                        chunks = []
-                        for i, r in enumerate(rows, 1):
-                            chunks.append(
-                                f"## [{i}] [{r['host']}] {r['path']}\n"
-                                f"**page:** {r['page_title'] or '(untitled)'}  "
-                                f"**section:** § {r['heading'] or '(intro)'}\n"
-                                f"**path:** `{r['heading_path']}`  "
-                                f"**url:** {r['url']}\n\n"
-                                f"{r['section_content']}\n"
-                            )
-                        text_payload = "\n---\n\n".join(chunks)
+                        text_payload = _ls_subtree(conn, host, prefix)
                     reply(rid, {"content": [{"type": "text",
                                               "text": text_payload}]})
                     continue
-                elif name == "cat_doc":
-                    t = a["path_or_url"]
-                    site = a.get("site") or get_active_site(conn)
-                    if a.get("all_sites"):
-                        site = None
-                    where = "url=? OR path=? OR path=?"
-                    qp2 = (t, t, t.rstrip("/"))
-                    if site:
-                        where = "(" + where + ") AND host=?"
-                        qp2 = qp2 + (site,)
-                    r = conn.execute(
-                        f"SELECT host,path,title,url,content,fetched_at "
-                        f"FROM pages WHERE {where}",
-                        qp2,
-                    ).fetchone()
-                    if not r:
-                        lp = (f"%{t}%",); lw = "path LIKE ?"
-                        if site:
-                            lw += " AND host=?"
-                            lp = lp + (site,)
-                        r = conn.execute(
-                            f"SELECT host,path,title,url,content,fetched_at "
-                            f"FROM pages WHERE {lw} ORDER BY length(path) LIMIT 1", lp,
-                        ).fetchone()
+                elif name == "cat":
+                    raw = a.get("path") or a.get("path_or_url")
+                    if not raw:
+                        reply(rid, error={"code": -32602,
+                                           "message": "cat requires a `path` argument"})
+                        continue
+                    r = _cat_lookup(conn, raw)
                     if r:
+                        # Sibling hint: ls of the parent directory
+                        parent = r["path"].rsplit("/", 1)[0] or "/"
+                        sibling_path = f"/{r['host']}{parent}/".replace("//", "/")
                         text_payload = (
                             f"# {r['title'] or '(untitled)'}\n"
                             f"\n"
@@ -1886,38 +2009,20 @@ def cmd_mcp(args):
                             f"- url:  {r['url']}\n"
                             f"- path: `{r['path']}`\n"
                             f"- fetched: {r['fetched_at']}\n"
+                            f"- siblings: `ls {sibling_path}`\n"
                             f"\n"
                             f"---\n"
                             f"\n"
                             f"{r['content']}"
                         )
                     else:
-                        text_payload = f"not found: {t}"
+                        text_payload = (
+                            f"not found: {raw}\n\n"
+                            "Tip: `ls /` to see indexed sites, then drill in."
+                        )
                     reply(rid, {"content": [{"type": "text",
                                               "text": text_payload}]})
                     continue
-                elif name == "list_sites":
-                    rows = conn.execute(
-                        "SELECT host, COUNT(*) AS pages, MAX(fetched_at) AS last_seen "
-                        "FROM pages GROUP BY host ORDER BY pages DESC"
-                    ).fetchall()
-                    payload = [dict(r) for r in rows]
-                elif name == "list_pages":
-                    sql = "SELECT host,path,title FROM pages WHERE 1=1"
-                    qp = []
-                    site_filter = a.get("site") or get_active_site(conn)
-                    if a.get("all_sites"):
-                        site_filter = None
-                    if site_filter:
-                        sql += " AND host=?"
-                        qp.append(site_filter)
-                    if a.get("path_prefix"):
-                        sql += " AND path LIKE ?"
-                        qp.append(a["path_prefix"].rstrip("%") + "%")
-                    sql += " ORDER BY host, path LIMIT ?"
-                    qp.append(a.get("limit", 200))
-                    rows = conn.execute(sql, qp).fetchall()
-                    payload = [dict(r) for r in rows]
                 elif name == "sync_site":
                     import argparse as _ap
                     ns = _ap.Namespace(seed=a["url"], prefix_only=False, force=False,
@@ -1936,20 +2041,6 @@ def cmd_mcp(args):
                     after = conn.execute("SELECT COUNT(*) AS c FROM pages").fetchone()["c"]
                     payload = {"pages_before": before, "pages_after": after,
                                "removed": before - after}
-                elif name == "get_active_docs":
-                    payload = {"active_site": get_active_site(conn)}
-                elif name == "set_active_docs":
-                    site = a.get("site") or ""
-                    if site:
-                        if "://" in site:
-                            site = urllib.parse.urlparse(site).netloc
-                        site = site.strip("/")
-                    if site:
-                        set_active_site(conn, site)
-                        payload = {"active_site": site}
-                    else:
-                        set_active_site(conn, None)
-                        payload = {"active_site": None}
                 elif name == "help":
                     payload = {"guide": MCP_ORCHESTRATION_GUIDE}
                 elif name == "clear_site":
@@ -2201,17 +2292,19 @@ def main(argv=None):
         "mcp",
         help="stdio MCP server",
         description=(
-            "Run as a stdio MCP server. Exposes 11 tools so a Claude agent\n"
-            "(or any MCP client) can search, browse, sync, and curate the\n"
+            "Run as a stdio MCP server. Exposes 7 tools so a Claude agent\n"
+            "(or any MCP client) can navigate, read, sync, and curate the\n"
             "local docs index from inside a conversation.\n"
+            "\n"
+            "The read surface is filesystem-shaped: `ls` walks the path\n"
+            "tree, `cat` reads one page. There is no search tool by design.\n"
             "\n"
             "Wire it up by adding this to claude_desktop_config.json:\n"
             "  {\"mcpServers\":{\"docs-index\":{\"command\":\"python\",\n"
             "    \"args\":[\"<path-to-this-file>\",\"mcp\"]}}}\n"
             "\n"
-            "Tools: search_docs, cat_doc, list_sites, list_pages,\n"
-            "sync_site, clear_site, prune_index, index_stats,\n"
-            "get_active_docs, set_active_docs, help."))
+            "Tools: ls, cat, sync_site, clear_site, prune_index,\n"
+            "index_stats, help."))
     pm.set_defaults(func=cmd_mcp)
 
     args = p.parse_args(argv)
