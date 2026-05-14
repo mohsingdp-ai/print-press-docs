@@ -1800,6 +1800,8 @@ def cmd_mcp(args):
         method = req.get("method")
         rid = req.get("id")
         params = req.get("params") or {}
+        if rid is None:
+            continue
         if method == "initialize":
             reply(rid, {"protocolVersion": "2024-11-05",
                         "capabilities": {"tools": {}},
